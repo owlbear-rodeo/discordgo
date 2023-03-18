@@ -42,8 +42,8 @@ type VoiceConnection struct {
 	speaking     bool
 	reconnecting bool // If true, voice connection is trying to reconnect
 
-	OpusSend chan []byte  // Chan for sending opus audio
-	OpusRecv chan *Packet // Chan for receiving opus audio
+	OpusSend chan RealtimePacket // Chan for sending opus audio
+	OpusRecv chan *Packet        // Chan for receiving opus audio
 
 	wsConn  *websocket.Conn
 	wsMutex sync.Mutex
@@ -56,9 +56,6 @@ type VoiceConnection struct {
 
 	// Used to send a close signal to goroutines
 	close chan struct{}
-
-	// Used to allow blocking until connected
-	connected chan bool
 
 	// Used to pass the sessionid from onVoiceStateUpdate
 	// sessionRecv chan string UNUSED ATM
@@ -76,7 +73,8 @@ type VoiceSpeakingUpdateHandler func(vc *VoiceConnection, vs *VoiceSpeakingUpdat
 // Speaking sends a speaking notification to Discord over the voice websocket.
 // This must be sent as true prior to sending audio and should be set to false
 // once finished sending audio.
-//  b  : Send true if speaking, false if not.
+//
+//	b  : Send true if speaking, false if not.
 func (v *VoiceConnection) Speaking(b bool) (err error) {
 
 	v.log(LogDebug, "called (%t)", b)
@@ -447,11 +445,10 @@ func (v *VoiceConnection) onEvent(message []byte) {
 		}
 
 		// Start the opusSender.
-		// TODO: Should we allow 48000/960 values to be user defined?
 		if v.OpusSend == nil {
-			v.OpusSend = make(chan []byte, 2)
+			v.OpusSend = make(chan RealtimePacket)
 		}
-		go v.opusSender(v.udpConn, v.close, v.OpusSend, 48000, 960)
+		go v.opusSender(v.udpConn, v.close, v.OpusSend)
 
 		// Start the opusReceiver
 		if !v.deaf {
@@ -497,8 +494,6 @@ func (v *VoiceConnection) onEvent(message []byte) {
 	default:
 		v.log(LogDebug, "unknown voice operation, %d, %s", e.Operation, string(e.RawData))
 	}
-
-	return
 }
 
 type voiceHeartbeatOp struct {
@@ -694,9 +689,15 @@ func (v *VoiceConnection) udpKeepAlive(udpConn *net.UDPConn, close <-chan struct
 	}
 }
 
+type RealtimePacket struct {
+	Payload        []byte
+	SequenceNumber uint16
+	Timestamp      uint32
+}
+
 // opusSender will listen on the given channel and send any
 // pre-encoded opus audio to Discord.  Supposedly.
-func (v *VoiceConnection) opusSender(udpConn *net.UDPConn, close <-chan struct{}, opus <-chan []byte, rate, size int) {
+func (v *VoiceConnection) opusSender(udpConn *net.UDPConn, close <-chan struct{}, opus <-chan RealtimePacket) {
 
 	if udpConn == nil || close == nil {
 		return
@@ -713,9 +714,7 @@ func (v *VoiceConnection) opusSender(udpConn *net.UDPConn, close <-chan struct{}
 		v.Unlock()
 	}()
 
-	var sequence uint16
-	var timestamp uint32
-	var recvbuf []byte
+	var recvbuf RealtimePacket
 	var ok bool
 	udpHeader := make([]byte, 12)
 	var nonce [24]byte
@@ -725,9 +724,6 @@ func (v *VoiceConnection) opusSender(udpConn *net.UDPConn, close <-chan struct{}
 	udpHeader[1] = 0x78
 	binary.BigEndian.PutUint32(udpHeader[8:], v.op2.SSRC)
 
-	// start a send loop that loops until buf chan is closed
-	ticker := time.NewTicker(time.Millisecond * time.Duration(size/(rate/1000)))
-	defer ticker.Stop()
 	for {
 
 		// Get data from chan.  If chan is closed, return.
@@ -752,41 +748,21 @@ func (v *VoiceConnection) opusSender(udpConn *net.UDPConn, close <-chan struct{}
 		}
 
 		// Add sequence and timestamp to udpPacket
-		binary.BigEndian.PutUint16(udpHeader[2:], sequence)
-		binary.BigEndian.PutUint32(udpHeader[4:], timestamp)
+		binary.BigEndian.PutUint16(udpHeader[2:], recvbuf.SequenceNumber)
+		binary.BigEndian.PutUint32(udpHeader[4:], recvbuf.Timestamp)
 
 		// encrypt the opus data
 		copy(nonce[:], udpHeader)
 		v.RLock()
-		sendbuf := secretbox.Seal(udpHeader, recvbuf, &nonce, &v.op4.SecretKey)
+		sendbuf := secretbox.Seal(udpHeader, recvbuf.Payload, &nonce, &v.op4.SecretKey)
 		v.RUnlock()
 
-		// block here until we're exactly at the right time :)
-		// Then send rtp audio packet to Discord over UDP
-		select {
-		case <-close:
-			return
-		case <-ticker.C:
-			// continue
-		}
 		_, err := udpConn.Write(sendbuf)
 
 		if err != nil {
 			v.log(LogError, "udp write error, %s", err)
 			v.log(LogDebug, "voice struct: %#v\n", v)
 			return
-		}
-
-		if (sequence) == 0xFFFF {
-			sequence = 0
-		} else {
-			sequence++
-		}
-
-		if (timestamp + uint32(size)) >= 0xFFFFFFFF {
-			timestamp = 0
-		} else {
-			timestamp += uint32(size)
 		}
 	}
 }
